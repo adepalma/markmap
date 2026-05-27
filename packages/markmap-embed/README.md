@@ -84,6 +84,35 @@ connection.editNode({ id: 'node-1', content: 'Updated node' });
 await connection.saveMap('client-123');
 ```
 
+The hosted test page also supports a same-origin HTTP persistence adapter:
+
+```txt
+https://mindmaps.capaholdings.com/?host=1&persistence=http&apiBase=/api/mindmaps
+```
+
+Expected API contract:
+
+```http
+GET /api/mindmaps/client-123
+Accept: application/json
+
+200 { "id": "client-123", "markdown": "# Strategy" }
+404 Not found
+```
+
+```http
+PUT /api/mindmaps/client-123
+Content-Type: application/json
+
+{ "markdown": "# Strategy" }
+```
+
+When the API requires bearer auth, set the browser session token before opening the host test page:
+
+```js
+sessionStorage.setItem('capa:mindmaps:apiToken', '<token>');
+```
+
 ## Web Component
 
 Use the custom element when the host app is plain HTML, Angular, Rails, Laravel, or any stack that can load an ES module.
