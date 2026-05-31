@@ -4,6 +4,21 @@ import type {
   MindmapPersistenceAdapter,
   MindmapTheme,
 } from '../../../packages/markmap-embed/src/index';
+import {
+  createScopedMapStorage,
+  createNewMap,
+  deleteSavedMap,
+  listSavedMaps,
+  loadSavedMap,
+  saveMap,
+} from './mapCatalog';
+import {
+  getDefaultLayoutMode,
+  isLayoutMode,
+  layoutModes,
+  moveMarkdownSibling,
+  type LayoutMode,
+} from './mapEditing';
 import './styles.css';
 
 const starterMarkdown = `# Client Implementation Map
@@ -98,6 +113,11 @@ let hostLatestMarkdown = '';
 let hostDirty = false;
 let nextNodeId = 1;
 let renderTimer = 0;
+let currentMapId = '';
+let currentMapTitle = 'Client Implementation Map';
+let currentMapCreatedAt = new Date().toISOString();
+let mapDirty = false;
+let selectedLayoutMode: LayoutMode = getDefaultLayoutMode();
 const nodeIdsByLineIndex = new Map<number, string>();
 const lineIndexByNodeId = new Map<string, number>();
 const hostRecentMapSummaries = new Map<string, HostMapSummary>();
@@ -129,6 +149,10 @@ const isEmbedHelpMode =
   window.location.pathname.replace(/\/$/, '') === '/embed-help' ||
   params.get('embedHelp') === '1';
 const parentOrigin = getAllowedParentOrigin();
+const storageScope = params.get('storageScope') || '';
+const currentStorage = storageScope
+  ? createScopedMapStorage(window.localStorage, storageScope)
+  : window.localStorage;
 
 if (params.get('theme') && themes[params.get('theme') || '']) {
   selectedTheme = params.get('theme') || selectedTheme;
@@ -140,11 +164,17 @@ if (
   selectedSample = params.get('sample') || selectedSample;
 }
 
+const requestedLayoutMode = params.get('layout');
+if (isLayoutMode(requestedLayoutMode)) {
+  selectedLayoutMode = requestedLayoutMode;
+}
+
 function getEmbedUrl() {
   const url = new URL('/', window.location.origin);
   url.searchParams.set('embed', '1');
   url.searchParams.set('theme', selectedTheme);
   url.searchParams.set('sample', selectedSample);
+  url.searchParams.set('layout', selectedLayoutMode);
   url.searchParams.set('parentOrigin', window.location.origin);
   return url.toString();
 }
@@ -345,6 +375,101 @@ function escapeHtml(value: string) {
 
 function stripNodeContent(value: string) {
   return value.replace(/<[^>]*>/g, '');
+}
+
+function getCurrentStorage() {
+  return currentStorage;
+}
+
+function getTitleFromMarkdown(markdown: string) {
+  return (
+    markdown
+      .split('\n')
+      .find((line) => /^#\s+/.test(line))
+      ?.replace(/^#\s+/, '')
+      .trim() || 'Untitled mindmap'
+  );
+}
+
+function setWorkspaceStatus(message: string) {
+  const status = document.querySelector<HTMLSpanElement>('#workspaceStatus');
+  if (status) status.textContent = message;
+}
+
+function setMapDirty(dirty: boolean, status?: string) {
+  mapDirty = dirty;
+  const dirtyState = document.querySelector<HTMLElement>('#mapDirtyState');
+  if (dirtyState) {
+    dirtyState.textContent = dirty ? 'Unsaved' : 'Saved';
+    dirtyState.dataset.state = dirty ? 'dirty' : 'saved';
+  }
+  if (status) setWorkspaceStatus(status);
+}
+
+function syncMapTitleInput() {
+  const input = document.querySelector<HTMLInputElement>('#mapTitleInput');
+  if (input) input.value = currentMapTitle;
+}
+
+function refreshSavedMapSelect() {
+  const select = document.querySelector<HTMLSelectElement>('#savedMapSelect');
+  if (!select) return;
+  const maps = listSavedMaps(getCurrentStorage());
+  select.innerHTML = [
+    '<option value="">Open saved map</option>',
+    ...maps.map((map) => {
+      const label = `${map.title} - ${new Date(map.updatedAt).toLocaleString()}`;
+      return `<option value="${escapeHtml(map.id)}">${escapeHtml(label)}</option>`;
+    }),
+  ].join('');
+  select.value = currentMapId;
+}
+
+function syncMapWorkspace(status?: string) {
+  syncMapTitleInput();
+  refreshSavedMapSelect();
+  const layoutSelect =
+    document.querySelector<HTMLSelectElement>('#layoutSelect');
+  if (layoutSelect) layoutSelect.value = selectedLayoutMode;
+  applyLayoutChrome();
+  setMapDirty(mapDirty, status);
+}
+
+function getLayoutLabel(mode: LayoutMode) {
+  const labels: Record<LayoutMode, string> = {
+    auto: 'Auto balance',
+    right: 'Right tree',
+    left: 'Left tree',
+    org: 'Org chart',
+  };
+  return labels[mode];
+}
+
+function getLayoutViewOptions() {
+  if (selectedLayoutMode === 'org') {
+    return {
+      maxWidth: 300,
+      spacingHorizontal: 96,
+      spacingVertical: 24,
+    };
+  }
+  if (selectedLayoutMode === 'auto') {
+    return {
+      spacingHorizontal: themes[selectedTheme].spacingHorizontal,
+      spacingVertical: Math.max(themes[selectedTheme].spacingVertical || 8, 12),
+    };
+  }
+  return undefined;
+}
+
+function applyLayoutChrome() {
+  const host = document.querySelector<HTMLElement>('#mapHost');
+  if (!host) return;
+  host.dataset.layoutMode = selectedLayoutMode;
+  host.setAttribute(
+    'aria-label',
+    `${getLayoutLabel(selectedLayoutMode)} mindmap preview`,
+  );
 }
 
 function getEditableLineIndex(node: { payload?: unknown }) {
@@ -568,9 +693,28 @@ mindmap.loadMap(id);</pre>
       <header class="topbar">
         <div class="brand">
           <h1>CAPA Mindmaps</h1>
-          <p>Embedded markmap playground for client apps, themes, resize behavior, and node events.</p>
+          <p id="workspaceStatus">Create, edit, save, open, and export visual maps.</p>
         </div>
         <div class="toolbar" aria-label="Mindmap controls">
+          <input id="mapTitleInput" class="toolbarInput" aria-label="Map title" value="${escapeHtml(currentMapTitle)}" />
+          <button id="newMapButton" type="button">New</button>
+          <select id="savedMapSelect" aria-label="Open saved map">
+            <option value="">Open saved map</option>
+          </select>
+          <button id="openMapButton" type="button">Open</button>
+          <button id="saveMapButton" type="button">Save</button>
+          <button id="deleteMapButton" class="dangerButton" type="button">Delete</button>
+          <button id="exportMarkdownButton" type="button">Markdown</button>
+          <button id="exportSvgButton" type="button">SVG</button>
+          <button id="exportPngButton" type="button">PNG</button>
+          <select id="layoutSelect" aria-label="Map layout">
+            ${layoutModes
+              .map(
+                (mode) =>
+                  `<option value="${mode}" ${mode === selectedLayoutMode ? 'selected' : ''}>${getLayoutLabel(mode)}</option>`,
+              )
+              .join('')}
+          </select>
           <select id="sampleSelect" aria-label="Load sample">
             <option value="implementation" ${selectedSample === 'implementation' ? 'selected' : ''}>Implementation</option>
             <option value="sales" ${selectedSample === 'sales' ? 'selected' : ''}>Sales Pipeline</option>
@@ -578,6 +722,7 @@ mindmap.loadMap(id);</pre>
           </select>
           <button id="fitButton" type="button">Fit</button>
           <button id="resetButton" type="button">Reset</button>
+          <strong id="mapDirtyState" class="dirtyState" data-state="saved">Saved</strong>
         </div>
       </header>
       <section class="workspace">
@@ -731,7 +876,8 @@ async function updateMindmap(
   const count = document.querySelector<HTMLSpanElement>('#nodeCount');
   if (status) status.textContent = 'Rendering';
   if (count) count.textContent = `${countNodes(content)} nodes`;
-  await embed?.update(content);
+  applyLayoutChrome();
+  await embed?.update(content, { viewOptions: getLayoutViewOptions() });
   if (status) status.textContent = 'Ready';
   postEmbedResize();
 }
@@ -822,6 +968,156 @@ async function renderCurrentPng() {
   }
 }
 
+function getExportBaseName() {
+  return (
+    currentMapTitle
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'mindmap'
+  );
+}
+
+function downloadBlob(filename: string, blob: Blob) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function downloadDataUrl(filename: string, dataUrl: string) {
+  const link = document.createElement('a');
+  link.href = dataUrl;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
+function exportMarkdown() {
+  downloadBlob(
+    `${getExportBaseName()}.md`,
+    new Blob([currentContent], { type: 'text/markdown;charset=utf-8' }),
+  );
+  setWorkspaceStatus('Markdown exported.');
+}
+
+function exportSvg() {
+  const svg = serializeCurrentSvg();
+  if (!svg) {
+    setWorkspaceStatus('Render a map before exporting SVG.');
+    return;
+  }
+  downloadBlob(
+    `${getExportBaseName()}.svg`,
+    new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }),
+  );
+  setWorkspaceStatus('SVG exported.');
+}
+
+async function exportPng() {
+  const png = await renderCurrentPng();
+  if (!png) {
+    setWorkspaceStatus('Render a map before exporting PNG.');
+    return;
+  }
+  downloadDataUrl(`${getExportBaseName()}.png`, png);
+  setWorkspaceStatus('PNG exported.');
+}
+
+function saveCurrentWorkspace(status = 'Saved map.') {
+  currentMapTitle =
+    document.querySelector<HTMLInputElement>('#mapTitleInput')?.value.trim() ||
+    getTitleFromMarkdown(currentContent);
+  if (!currentMapId) {
+    const created = createNewMap(getCurrentStorage(), {
+      title: currentMapTitle,
+      layoutMode: selectedLayoutMode,
+    });
+    currentMapId = created.id;
+    currentMapCreatedAt = created.createdAt;
+  }
+  const saved = saveMap(getCurrentStorage(), {
+    id: currentMapId,
+    title: currentMapTitle,
+    layoutMode: selectedLayoutMode,
+    markdown: currentContent,
+    createdAt: currentMapCreatedAt,
+    updatedAt: new Date().toISOString(),
+  });
+  currentMapId = saved.id;
+  currentMapTitle = saved.title;
+  selectedLayoutMode = saved.layoutMode;
+  currentMapCreatedAt = saved.createdAt;
+  setMapDirty(false, status);
+  refreshSavedMapSelect();
+  postEmbedChange('saveMap');
+}
+
+async function loadWorkspaceMap(id: string) {
+  const map = loadSavedMap(getCurrentStorage(), id);
+  if (!map) {
+    setWorkspaceStatus('Saved map was not found.');
+    refreshSavedMapSelect();
+    return;
+  }
+  currentMapId = map.id;
+  currentMapTitle = map.title;
+  selectedLayoutMode = map.layoutMode;
+  currentMapCreatedAt = map.createdAt;
+  currentContent = map.markdown;
+  const editor = document.querySelector<HTMLTextAreaElement>('#editor');
+  if (editor) editor.value = currentContent;
+  await updateMindmap(currentContent);
+  mapDirty = false;
+  syncMapWorkspace(`Opened ${map.title}.`);
+  postEmbedChange('openMap');
+}
+
+async function createWorkspaceMap() {
+  const title = window.prompt('Map title', 'Untitled mindmap')?.trim();
+  if (!title) return;
+  const map = createNewMap(getCurrentStorage(), {
+    title,
+    layoutMode: selectedLayoutMode,
+  });
+  currentMapId = map.id;
+  currentMapTitle = map.title;
+  selectedLayoutMode = map.layoutMode;
+  currentMapCreatedAt = map.createdAt;
+  currentContent = map.markdown;
+  const editor = document.querySelector<HTMLTextAreaElement>('#editor');
+  if (editor) editor.value = currentContent;
+  await updateMindmap(currentContent);
+  mapDirty = false;
+  syncMapWorkspace(`Created ${map.title}.`);
+  postEmbedChange('newMap');
+}
+
+function deleteCurrentWorkspaceMap() {
+  const id =
+    document.querySelector<HTMLSelectElement>('#savedMapSelect')?.value ||
+    currentMapId;
+  if (!id) {
+    setWorkspaceStatus('Select a saved map before deleting.');
+    return;
+  }
+  const map = loadSavedMap(getCurrentStorage(), id);
+  const label = map?.title || id;
+  if (!window.confirm(`Delete "${label}"?`)) return;
+  deleteSavedMap(getCurrentStorage(), id);
+  if (currentMapId === id) {
+    currentMapId = '';
+    currentMapCreatedAt = new Date().toISOString();
+    setMapDirty(true, 'Deleted saved map. Current canvas is unsaved.');
+  }
+  refreshSavedMapSelect();
+}
+
 function wantsFormat(message: MindmapHostMessage, format: string) {
   if (!Array.isArray(message.formats)) return false;
   return message.formats.includes(format);
@@ -899,6 +1195,9 @@ function postEmbedChange(reason: string, requestId?: unknown) {
   postParentMessage({
     type: 'capa:mindmap:change',
     dirty: true,
+    mapId: currentMapId || undefined,
+    title: currentMapTitle,
+    layoutMode: selectedLayoutMode,
     markdown: currentContent,
     reason,
     requestId,
@@ -977,6 +1276,7 @@ async function applyNodeLineEdit(
   const target = document.querySelector<HTMLParagraphElement>('#selectedNode');
   if (target) target.textContent = selectedNode;
   setNodeEditorState(true, trimmedText, 'Saved.');
+  setMapDirty(true, 'Node edited.');
   await updateMindmap(nextContent, { preserveNodeIds: true });
 
   postParentMessage({
@@ -1024,6 +1324,209 @@ function wireNodeEditor() {
         parts ? 'Edit canceled.' : 'Select a heading or list item to edit it.',
       );
     });
+}
+
+function getClosestRenderedNode(target: EventTarget | null) {
+  return getClosestRenderedNodeElement(target)?.__data__ as
+    | {
+        content: string;
+        payload?: unknown;
+        state?: { depth?: number; path?: string };
+      }
+    | undefined;
+}
+
+function getClosestRenderedNodeElement(target: EventTarget | null) {
+  let element = target as (Element & { __data__?: unknown }) | null;
+  while (element) {
+    const className = String(element.getAttribute?.('class') || '');
+    if (className.split(/\s+/).includes('markmap-node')) {
+      return element;
+    }
+    element = element.parentElement as
+      | (Element & { __data__?: unknown })
+      | null;
+  }
+}
+
+function getRenderedNodeLineIndex(node: { payload?: unknown } | undefined) {
+  if (!node) return undefined;
+  const lineIndex = getEditableLineIndex(node);
+  const line =
+    lineIndex == null ? undefined : currentContent.split('\n')[lineIndex];
+  return line && getEditableLineParts(line) ? lineIndex : undefined;
+}
+
+function closeInlineNodeEditor() {
+  document.querySelector<HTMLElement>('#inlineNodeEditor')?.remove();
+}
+
+function openInlineNodeEditor(
+  node: {
+    content: string;
+    payload?: unknown;
+    state?: { depth?: number; path?: string };
+  },
+  event: MouseEvent,
+) {
+  closeInlineNodeEditor();
+  selectNodeForEditing(node);
+  if (selectedNodeLineIndex == null) {
+    setWorkspaceStatus('That node is not editable.');
+    return;
+  }
+
+  const line = currentContent.split('\n')[selectedNodeLineIndex];
+  const parts = getEditableLineParts(line || '');
+  if (!parts) {
+    setWorkspaceStatus('That node is not editable.');
+    return;
+  }
+
+  const editor = document.createElement('form');
+  editor.id = 'inlineNodeEditor';
+  editor.className = 'inlineNodeEditor';
+  editor.style.left = `${Math.min(event.clientX + 12, window.innerWidth - 320)}px`;
+  editor.style.top = `${Math.min(event.clientY + 12, window.innerHeight - 96)}px`;
+  editor.innerHTML = `
+    <label class="inlineNodeLabel" for="inlineNodeInput">Edit node</label>
+    <div class="inlineNodeRow">
+      <input id="inlineNodeInput" class="nodeEditInput" value="${escapeHtml(parts.text)}" />
+      <button class="smallButton" type="submit">Save</button>
+      <button class="smallButton quietButton" type="button" data-inline-cancel>Cancel</button>
+    </div>
+  `;
+  document.body.append(editor);
+
+  const input = editor.querySelector<HTMLInputElement>('#inlineNodeInput');
+  input?.focus();
+  input?.select();
+
+  editor.addEventListener('submit', (submitEvent) => {
+    submitEvent.preventDefault();
+    const nextText = input?.value.trim();
+    if (!nextText || selectedNodeLineIndex == null) return;
+    void applyNodeLineEdit(selectedNodeLineIndex, nextText).then(() => {
+      closeInlineNodeEditor();
+    });
+  });
+  editor
+    .querySelector<HTMLButtonElement>('[data-inline-cancel]')
+    ?.addEventListener('click', closeInlineNodeEditor);
+  input?.addEventListener('keydown', (keyEvent) => {
+    if (keyEvent.key === 'Escape') closeInlineNodeEditor();
+  });
+}
+
+function wireInlineNodeEditing(host: HTMLElement) {
+  document.addEventListener(
+    'dblclick',
+    (event) => {
+      if (!host.contains(event.target as Node | null)) return;
+      const node = getClosestRenderedNode(event.target);
+      if (!node) return;
+      event.preventDefault();
+      openInlineNodeEditor(node, event);
+    },
+    true,
+  );
+}
+
+function setDragTarget(element?: Element & { __data__?: unknown }) {
+  document
+    .querySelectorAll('.markmap-node.dragTarget')
+    .forEach((node) => node.classList.remove('dragTarget'));
+  if (element) element.classList.add('dragTarget');
+}
+
+function wireNodeDragReorder(host: HTMLElement) {
+  let sourceLineIndex: number | undefined;
+  let startX = 0;
+  let startY = 0;
+  let dragging = false;
+
+  document.addEventListener(
+    'pointerdown',
+    (event) => {
+      if (event.button !== 0 || !host.contains(event.target as Node | null)) {
+        return;
+      }
+      if ((event.target as Element | null)?.closest('#inlineNodeEditor'))
+        return;
+      const node = getClosestRenderedNode(event.target);
+      sourceLineIndex = getRenderedNodeLineIndex(node);
+      if (sourceLineIndex == null) return;
+      startX = event.clientX;
+      startY = event.clientY;
+      dragging = false;
+    },
+    true,
+  );
+
+  document.addEventListener(
+    'pointermove',
+    (event) => {
+      if (sourceLineIndex == null) return;
+      const distance = Math.hypot(
+        event.clientX - startX,
+        event.clientY - startY,
+      );
+      if (!dragging && distance < 8) return;
+      dragging = true;
+      document.body.classList.add('nodeDragActive');
+      const target = getClosestRenderedNodeElement(
+        document.elementFromPoint(event.clientX, event.clientY),
+      );
+      setDragTarget(target);
+      event.preventDefault();
+    },
+    true,
+  );
+
+  document.addEventListener(
+    'pointerup',
+    (event) => {
+      if (sourceLineIndex == null) return;
+      const fromLineIndex = sourceLineIndex;
+      const wasDragging = dragging;
+      sourceLineIndex = undefined;
+      dragging = false;
+      document.body.classList.remove('nodeDragActive');
+      const targetElement = getClosestRenderedNodeElement(
+        document.elementFromPoint(event.clientX, event.clientY),
+      );
+      setDragTarget();
+      if (!wasDragging || !targetElement) return;
+
+      const targetLineIndex = getRenderedNodeLineIndex(
+        targetElement.__data__ as { payload?: unknown } | undefined,
+      );
+      if (targetLineIndex == null) return;
+      const result = moveMarkdownSibling(
+        currentContent,
+        fromLineIndex,
+        targetLineIndex,
+      );
+      if (!result.moved) {
+        setWorkspaceStatus('Drag nodes within the same sibling group.');
+        return;
+      }
+      const editor = document.querySelector<HTMLTextAreaElement>('#editor');
+      if (editor) editor.value = result.markdown;
+      setMapDirty(true, 'Node reordered.');
+      void updateMindmap(result.markdown).then(() => {
+        postEmbedChange('nodeReorder');
+      });
+    },
+    true,
+  );
+
+  document.addEventListener('pointercancel', () => {
+    sourceLineIndex = undefined;
+    dragging = false;
+    document.body.classList.remove('nodeDragActive');
+    setDragTarget();
+  });
 }
 
 function getEmbedWidth() {
@@ -1147,7 +1650,9 @@ function wireEmbedResize() {
 function scheduleUpdate(content: string) {
   window.clearTimeout(renderTimer);
   renderTimer = window.setTimeout(() => {
-    void updateMindmap(content);
+    void updateMindmap(content).then(() => {
+      postEmbedChange('markdownEdit');
+    });
   }, 180);
 }
 
@@ -1186,6 +1691,73 @@ function refreshEmbedSnippets() {
   if (url) url.value = getEmbedUrl();
   if (blocks[0]) blocks[0].textContent = getIframeSnippet();
   if (blocks[1]) blocks[1].textContent = getScriptSnippet();
+}
+
+function wireWorkspaceToolbar() {
+  syncMapWorkspace();
+  document
+    .querySelector<HTMLInputElement>('#mapTitleInput')
+    ?.addEventListener('input', (event) => {
+      currentMapTitle = (event.target as HTMLInputElement).value;
+      setMapDirty(true, 'Title changed.');
+    });
+  document
+    .querySelector<HTMLButtonElement>('#newMapButton')
+    ?.addEventListener('click', () => {
+      void createWorkspaceMap();
+    });
+  document
+    .querySelector<HTMLButtonElement>('#openMapButton')
+    ?.addEventListener('click', () => {
+      const id =
+        document.querySelector<HTMLSelectElement>('#savedMapSelect')?.value;
+      if (!id) {
+        setWorkspaceStatus('Select a saved map first.');
+        return;
+      }
+      void loadWorkspaceMap(id);
+    });
+  document
+    .querySelector<HTMLSelectElement>('#savedMapSelect')
+    ?.addEventListener('change', (event) => {
+      const id = (event.target as HTMLSelectElement).value;
+      if (id) void loadWorkspaceMap(id);
+    });
+  document
+    .querySelector<HTMLButtonElement>('#saveMapButton')
+    ?.addEventListener('click', () => {
+      saveCurrentWorkspace();
+    });
+  document
+    .querySelector<HTMLButtonElement>('#deleteMapButton')
+    ?.addEventListener('click', () => {
+      deleteCurrentWorkspaceMap();
+    });
+  document
+    .querySelector<HTMLButtonElement>('#exportMarkdownButton')
+    ?.addEventListener('click', exportMarkdown);
+  document
+    .querySelector<HTMLButtonElement>('#exportSvgButton')
+    ?.addEventListener('click', exportSvg);
+  document
+    .querySelector<HTMLButtonElement>('#exportPngButton')
+    ?.addEventListener('click', () => {
+      void exportPng().catch((error: unknown) => {
+        setWorkspaceStatus(`PNG export failed: ${getErrorMessage(error)}`);
+      });
+    });
+  document
+    .querySelector<HTMLSelectElement>('#layoutSelect')
+    ?.addEventListener('change', (event) => {
+      const value = (event.target as HTMLSelectElement).value;
+      if (!isLayoutMode(value)) return;
+      selectedLayoutMode = value;
+      setMapDirty(true, `Layout set to ${getLayoutLabel(value)}.`);
+      refreshEmbedSnippets();
+      void updateMindmap(currentContent, { preserveNodeIds: true }).then(() => {
+        postEmbedChange('layoutChange');
+      });
+    });
 }
 
 function wireEmbedTools() {
@@ -1873,6 +2445,7 @@ async function boot() {
     autoFit: true,
     autoResize: true,
     theme: themes[selectedTheme],
+    viewOptions: getLayoutViewOptions(),
     parserOptions: {
       sanitize: true,
     },
@@ -1883,6 +2456,8 @@ async function boot() {
 
   wireHostMessages();
   wireEmbedResize();
+  wireInlineNodeEditing(host);
+  wireNodeDragReorder(host);
 
   if (isEmbedMode) return;
   if (!editor) return;
@@ -1890,10 +2465,12 @@ async function boot() {
   document.querySelector<HTMLSpanElement>('#nodeCount')!.textContent =
     `${countNodes(content)} nodes`;
 
+  wireWorkspaceToolbar();
   wireNodeEditor();
 
   editor.addEventListener('input', () => {
     currentContent = editor.value;
+    setMapDirty(true, 'Editing markdown.');
     scheduleUpdate(editor.value);
   });
   document
@@ -1905,12 +2482,20 @@ async function boot() {
     .querySelector<HTMLButtonElement>('#resetButton')
     ?.addEventListener('click', () => {
       selectedSample = 'implementation';
+      currentMapId = '';
+      currentMapTitle = getTitleFromMarkdown(starterMarkdown);
+      currentMapCreatedAt = new Date().toISOString();
+      selectedLayoutMode = getDefaultLayoutMode();
       editor.value = starterMarkdown;
       const sampleSelect =
         document.querySelector<HTMLSelectElement>('#sampleSelect');
       if (sampleSelect) sampleSelect.value = selectedSample;
       refreshEmbedSnippets();
-      void updateMindmap(editor.value);
+      setMapDirty(true, 'Reset to starter map.');
+      syncMapTitleInput();
+      void updateMindmap(editor.value).then(() => {
+        postEmbedChange('resetMap');
+      });
     });
   document
     .querySelector<HTMLSelectElement>('#sampleSelect')
@@ -1918,8 +2503,16 @@ async function boot() {
       const value = (event.target as HTMLSelectElement).value;
       selectedSample = value;
       editor.value = getSample(value);
+      currentMapId = '';
+      currentMapTitle = getTitleFromMarkdown(editor.value);
+      currentMapCreatedAt = new Date().toISOString();
+      selectedLayoutMode = getDefaultLayoutMode();
       refreshEmbedSnippets();
-      void updateMindmap(editor.value);
+      setMapDirty(true, 'Loaded sample. Save it to keep changes.');
+      syncMapTitleInput();
+      void updateMindmap(editor.value).then(() => {
+        postEmbedChange('sampleMap');
+      });
     });
   document
     .querySelectorAll<HTMLButtonElement>('.themeButton')
